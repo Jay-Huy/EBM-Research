@@ -1,0 +1,36 @@
+# research notes, plans and reference code - not in git
+docs/
+plans/
+samples/
+models/theory/
+Claude outputs/
+
+# figures of the notes at the repo root
+/*.png
+
+# run results: metrics, checkpoints, plots (large)
+results/*
+!results/.gitkeep
+
+# downloaded / built data - always under data/<task>/raw/
+data/**/raw/
+
+# tests and their logs - not in git
+tests/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+
+# Weights & Biases (runs write to results/<run>/wandb; this catches a stray one at the root)
+wandb/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
