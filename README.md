@@ -61,6 +61,7 @@ Per run, set these keys on the command line with `--set` (dotted keys; only keys
 | `model.n_heads` | `1` \| `8` | `1` |
 | `model.tie_mode` | `orbit` \| `hard` (ablation: no W_v, W_o, exact gradient of E) | `orbit` |
 | `train.clip_grad` | `false` \| `true` (clip the gradient norm at `train.clip_grad_norm`, 1.0) | `false` |
+| `train.mu_penalty` | `0` (off) \| λ_μ > 0: add λ_μ·max(0, μ − `train.mu_max`)² to the loss (μ = Σ_h ‖W_q^h‖₂‖W_k^h‖₂, Theorem 1: μ < 1/2; `mu_max` 0.45) | `0` |
 
 Any other key can be overridden the same way for a quick try, e.g. `--set train.lr=3e-4`.
 
@@ -77,7 +78,7 @@ python train.py --config config/<task>.yaml [--set key=value ...]
 | continue an interrupted run (same W&B run) | `python train.py --resume results/sudoku_rrn-et-unroll-1h` |
 | test run, nothing sent to W&B | add `wandb.mode=disabled` to `--set` (`offline`: keep locally, upload later with `wandb sync`) |
 
-- W&B: run `{mode}-{backward}-{n_heads}h` in the task's project, with `-hard` appended for `model.tie_mode=hard`.
+- W&B: run `{mode}-{backward}-{n_heads}h` in the task's project, with `-hard` appended for `model.tie_mode=hard` and `-mu{λ_μ}` for `train.mu_penalty` > 0 (e.g. `et-unroll-1h-mu10`).
 - Run folder `results/{task}-{run name}`, e.g. `results/sudoku_rrn-et-unroll-1h` (`-2`, `-3`, … if taken):
   - `config.yaml`: full config with the seed
   - `train.log`: train / test lines, `% converged` of test_id, saved checkpoints

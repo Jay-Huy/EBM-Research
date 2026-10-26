@@ -30,6 +30,8 @@ train:
   tie_cross: 1.0             # coefficient of R_cross in the loss (Task 5.2, tests/check_tie_scale.py)
   clip_grad: false           # clip the total L2 norm of the gradient before optimizer.step() (off by default)
   clip_grad_norm: 1.0        # max norm when clip_grad is true
+  mu_penalty: 0.0            # coefficient of max(0, mu - mu_max)^2 in the loss (Theorem 1: mu < 1/2); 0 = off
+  mu_max: 0.45               # threshold of the mu penalty (below 1/2 for a margin)
   converge_steps: 100        # test_id: one pass of this many steps; loss / metric read at max_gradient_steps (Task 6)
   converge_tol: 1.0e-5       # a sample converges if local dist < this within converge_steps
   converge_frac: 0.99        # convergence_checkpoint.pt (unroll runs) once this fraction of test_id converges

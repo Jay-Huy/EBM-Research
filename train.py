@@ -11,7 +11,8 @@ Run:
 Done (Task 5.1-5.8, 6):
     - build_optimizer(model, cfg): adam | adamw from cfg["train"] (lr, betas, weight_decay)
     - train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross): one optimizer step on one batch,
-      loss = task loss + tie_self * R_self + tie_cross * R_cross (tie coefficients from cfg["train"]);
+      loss = task loss + tie_self * R_self + tie_cross * R_cross (tie coefficients from cfg["train"])
+      + mu_penalty * max(0, mu - mu_max)^2 (soft constraint mu < 1/2 of Theorem 1; train.mu_penalty, 0 = off);
       Forced: model.retract() after the step
     - main(): config, seed, device, datasets, model, optimizer, run folder (config.yaml, train.log), W&B, then the loop
       by train.schedule (Task 5.6):
@@ -20,7 +21,8 @@ Done (Task 5.1-5.8, 6):
       test every train.test_every (epochs or steps) on every split except "train" (Task 5.5), loop by backward
       (engine.test_loop); 4 fixed samples per split to a wandb.Table at each test (Task 4.3)
     - logged (Task 4.1, 4.2): train/loss (total), train/<metric>, train/grad_norm, train/last_local_dist (local dist
-      at step max_gradient_steps of the training forward, mean), theory/mu (self-attention mu at the log), tie/self_mse, tie/cross_mse,
+      at step max_gradient_steps of the training forward, mean), theory/mu (self-attention mu at the log),
+      theory/mu_penalty (max(0, mu - mu_max)^2, mean; only with train.mu_penalty > 0), tie/self_mse, tie/cross_mse,
       ift/* (backward 'ift' only), test_id/loss, test_id/<metric>, test_ood/<metric>; s/step on the terminal only (5.7)
     - checkpoints (Task 6, utils/checkpoint.py), in <run>/checkpoints/:
         latest_checkpoint.pt every epoch (schedule 'epoch') / every test (schedule 'step'), overwritten
@@ -64,12 +66,26 @@ def build_optimizer(model, cfg):
                                       weight_decay=t["weight_decay"])
 
 
-def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross, clip_norm=None):
+def mu_penalty(model, mu_max):
+    """max(0, mu - mu_max)^2, mu = sum_h ||W_q^h||_2 ||W_k^h||_2 of the self-attention (Theorem 1: E has a minimum
+    when mu < 1/2); 0 while mu <= mu_max. Differentiable (autograd through the SVD): the gradient of ||W||_2 is
+    u_1 v_1^T, so only the top singular direction of each W_q^h, W_k^h is shrunk. Returns (penalty, mu)."""
+    blk = model.core.self_attn
+    d_h = blk.d_head
+    mu = sum(torch.linalg.matrix_norm(blk.W_q.weight[h * d_h:(h + 1) * d_h], 2)
+             * torch.linalg.matrix_norm(blk.W_k.weight[h * d_h:(h + 1) * d_h], 2)
+             for h in range(blk.n_heads))
+    return torch.relu(mu - mu_max) ** 2, mu.detach()
+
+
+def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross, clip_norm=None,
+               mu_coef=0.0, mu_max=0.45):
     """One optimizer step on one batch.
 
     - forward with grad: Z* by config.backward (unroll: max_gradient_steps steps; ift: fixed point, then IFT backward)
     - loss = task loss (model.compute_loss: CE for Sudoku, MSE for the matrix tasks)
              + tie_self * R_self + tie_cross * R_cross,   R = model.core.tie_penalty() (relative tie error, heads.py)
+             + mu_coef * max(0, mu - mu_max)^2   (mu_penalty; only when mu_coef > 0: train.mu_penalty, train.mu_max)
       the tie term is added here, not in model.forward: out["loss"] stays the task loss (test loss without tie)
     - loss.backward(), total L2 norm of the gradient (before the step and before any clipping), optimizer.step()
     - clip_norm (train.clip_grad_norm when train.clip_grad is true, else None): clip the total gradient norm
@@ -77,6 +93,7 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
     - returns dict:
         loss        float, the total loss (task + tie), logged as train/loss
         tie         dict {"self", "cross"}: R before the step (the values in the loss), logged as tie/self, tie/cross
+        mu_penalty  float, max(0, mu - mu_max)^2 before the step (unweighted), or None when mu_coef = 0
         metric      dict, dataset.metric(model.predict(outputs), labels)   (Sudoku: board_acc, cell_acc; toy: mse)
         grad_norm   float
         steps, converged, local_dist, global_dist   (B,) tensors of the forward (see EnergyLoopModel.solve)
@@ -87,6 +104,10 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
     out = model(batch["inputs"], batch["labels"])
     tie = model.core.tie_penalty()
     loss = out["loss"] + tie_self * tie["self"] + tie_cross * tie["cross"]
+    pen = None
+    if mu_coef > 0:
+        pen, _ = mu_penalty(model, mu_max)
+        loss = loss + mu_coef * pen
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     if clip_norm is None:
@@ -100,6 +121,7 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
     return {
         "loss": loss.item(),
         "tie": {k: v.item() for k, v in tie.items()},
+        "mu_penalty": None if pen is None else pen.item(),
         "metric": metric,
         "grad_norm": grad_norm.item(),
         **{k: out[k] for k in ("steps", "converged", "local_dist", "global_dist")},
@@ -138,6 +160,8 @@ class TrainWindow:
         self.values["train/last_local_dist"].append(r["local_dist"].mean().item())   # ||Z_T - Z_{T-1}||, step T
         self.values["tie/self_mse"].append(r["tie"]["self"])
         self.values["tie/cross_mse"].append(r["tie"]["cross"])
+        if r["mu_penalty"] is not None:
+            self.values["theory/mu_penalty"].append(r["mu_penalty"])
         if r["backward"] is not None:
             bw = r["backward"]
             self.ift["ift/mean_backward_iterations"].append(bw["iters"])
@@ -219,6 +243,7 @@ def main():
             ckpt = load_checkpoint(args.init_from)
             cfg["init_from"] = {"path": str(Path(args.init_from).resolve()), ckpt["x_name"]: ckpt["x"]}
     t = cfg["train"]
+    mu_coef, mu_max = t.get("mu_penalty", 0.0), t.get("mu_max", 0.45)        # absent in configs of older runs
     for key in ("tie_self", "tie_cross"):
         if t[key] is None:
             raise ValueError(f"train.{key} is not set (config/{cfg['task']}.yaml or --set train.{key}=...)")
@@ -266,7 +291,8 @@ def main():
                    f"params {sum(p.numel() for p in model.parameters()):,}")
     log.kv("loop", f"max_gradient_steps {mc.max_gradient_steps}, step_size {mc.step_size}")
     log.kv("optimizer", f"{t['optimizer']}, lr {t['lr']}, batch {cfg['data']['batch_size']}, tie {t['tie_self']} / "
-                        f"{t['tie_cross']}, clip grad " + (f"at {t['clip_grad_norm']}" if t["clip_grad"] else "off"))
+                        f"{t['tie_cross']}, clip grad " + (f"at {t['clip_grad_norm']}" if t["clip_grad"] else "off")
+                        + ", mu penalty " + (f"{mu_coef:g} at mu > {mu_max:g}" if mu_coef > 0 else "off"))
     log.kv("splits", ", ".join(f"{s} {len(d):,}" for s, d in datasets.items()))
     log.kv("test", f"{', '.join(test_splits)} ({'all samples' if test_size is None else f'{test_size} samples'}), "
                    f"loop {loop}, every {t['test_every']} {x_name}")
@@ -325,7 +351,8 @@ def main():
 
     def step(batch):
         window.add(train_step(model, optimizer, batch, train_set, device, dtype, t["tie_self"], t["tie_cross"],
-                                clip_norm=t["clip_grad_norm"] if t["clip_grad"] else None))
+                                clip_norm=t["clip_grad_norm"] if t["clip_grad"] else None,
+                                mu_coef=mu_coef, mu_max=mu_max))
 
     if ckpt is not None and args.resume:
         set_rng_state(ckpt["rng"])                                   # same data order as without the interruption
