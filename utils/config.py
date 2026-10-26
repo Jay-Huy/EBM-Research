@@ -89,9 +89,10 @@ def pick_seed():
 
 
 def run_name(cfg):
-    """W&B run name inside the task's project: '{mode}-{backward}-{n_heads}h', e.g. 'et-unroll-1h'."""
+    """W&B run name inside the task's project: '{mode}-{backward}-{n_heads}h', e.g. 'et-unroll-1h';
+    '-hard' appended with model.tie_mode 'hard' (no W_v, W_o), e.g. 'et-unroll-1h-hard'."""
     m = cfg["model"]
-    return f"{m['mode']}-{m['backward']}-{m['n_heads']}h"
+    return f"{m['mode']}-{m['backward']}-{m['n_heads']}h" + ("-hard" if m.get("tie_mode") == "hard" else "")
 
 
 def make_run_dir(cfg, root=RESULTS_DIR):

@@ -9,6 +9,7 @@ model:                       # passed to build_model(task, **model)
   mode: et                   # et | forced                 (per run, --set)
   backward: unroll           # unroll | ift                (per run, --set)
   n_heads: 1                 # 1 | 8                       (per run, --set)
+  tie_mode: orbit            # orbit | hard (ablation: no W_v, W_o; exact gradient of E) (per run, --set)
   step_size: 0.75
   max_gradient_steps: 16      # T: steps of the loop in training (unroll) and in fixed_steps inference
 
@@ -27,6 +28,8 @@ train:
   test_every: 100            # test ID and OOD every this many iterations (steps)
   tie_self: null             # coefficient of R_self in the loss (Task 5.2)
   tie_cross: null            # coefficient of R_cross in the loss (Task 5.2)
+  clip_grad: false           # clip the total L2 norm of the gradient before optimizer.step() (off by default)
+  clip_grad_norm: 1.0        # max norm when clip_grad is true
   converge_steps: 100        # test_id: one pass of this many steps; loss / metric read at max_gradient_steps (Task 6)
   converge_tol: 1.0e-5       # a sample converges if local dist < this within converge_steps
   converge_frac: 0.99        # convergence_checkpoint.pt (unroll runs) once this fraction of test_id converges

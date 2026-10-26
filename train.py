@@ -19,7 +19,8 @@ Done (Task 5.1-5.8, 6):
         step:  new batches drawn on the fly up to train.iterations; x axis = step; train logged every LOG_EVERY steps
       test every train.test_every (epochs or steps) on every split except "train" (Task 5.5), loop by backward
       (engine.test_loop); 4 fixed samples per split to a wandb.Table at each test (Task 4.3)
-    - logged (Task 4.1, 4.2): train/loss (total), train/<metric>, train/grad_norm, tie/self_mse, tie/cross_mse,
+    - logged (Task 4.1, 4.2): train/loss (total), train/<metric>, train/grad_norm, train/last_local_dist (local dist
+      at step max_gradient_steps of the training forward, mean), theory/mu (self-attention mu at the log), tie/self_mse, tie/cross_mse,
       ift/* (backward 'ift' only), test_id/loss, test_id/<metric>, test_ood/<metric>; s/step on the terminal only (5.7)
     - checkpoints (Task 6, utils/checkpoint.py), in <run>/checkpoints/:
         latest_checkpoint.pt every epoch (schedule 'epoch') / every test (schedule 'step'), overwritten
@@ -63,14 +64,15 @@ def build_optimizer(model, cfg):
                                       weight_decay=t["weight_decay"])
 
 
-def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross):
+def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross, clip_norm=None):
     """One optimizer step on one batch.
 
     - forward with grad: Z* by config.backward (unroll: max_gradient_steps steps; ift: fixed point, then IFT backward)
     - loss = task loss (model.compute_loss: CE for Sudoku, MSE for the matrix tasks)
              + tie_self * R_self + tie_cross * R_cross,   R = model.core.tie_penalty() (relative tie error, heads.py)
       the tie term is added here, not in model.forward: out["loss"] stays the task loss (test loss without tie)
-    - loss.backward(), total L2 norm of the gradient (before the step), optimizer.step()
+    - loss.backward(), total L2 norm of the gradient (before the step and before any clipping), optimizer.step()
+    - clip_norm (train.clip_grad_norm when train.clip_grad is true, else None): clip the total gradient norm
     - Forced: model.retract() after the step (every A_h back to symmetric); no-op for ET
     - returns dict:
         loss        float, the total loss (task + tie), logged as train/loss
@@ -87,7 +89,10 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
     loss = out["loss"] + tie_self * tie["self"] + tie_cross * tie["cross"]
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    grad_norm = torch.sqrt(sum(p.grad.pow(2).sum() for p in model.parameters() if p.grad is not None))
+    if clip_norm is None:
+        grad_norm = torch.sqrt(sum(p.grad.pow(2).sum() for p in model.parameters() if p.grad is not None))
+    else:                                   # train.clip_grad: scale the gradient to norm <= clip_norm
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)      # norm before clipping
     optimizer.step()
     model.retract()
     with torch.no_grad():
@@ -130,6 +135,7 @@ class TrainWindow:
         for k, v in r["metric"].items():
             self.values[f"train/{k}"].append(v)
         self.values["train/grad_norm"].append(r["grad_norm"])
+        self.values["train/last_local_dist"].append(r["local_dist"].mean().item())   # ||Z_T - Z_{T-1}||, step T
         self.values["tie/self_mse"].append(r["tie"]["self"])
         self.values["tie/cross_mse"].append(r["tie"]["cross"])
         if r["backward"] is not None:
@@ -145,6 +151,16 @@ class TrainWindow:
         sec = (time.time() - self.t0) / max(n, 1)
         self.reset()
         return out, sec
+
+
+@torch.no_grad()
+def self_attn_mu(model):
+    """mu = sum_h ||W_q^h||_2 ||W_k^h||_2 of the self-attention (Theorem 1: E has a minimum when mu < 1/2)."""
+    blk = model.core.self_attn
+    d_h = blk.d_head
+    return sum((torch.linalg.matrix_norm(blk.W_q.weight[h * d_h:(h + 1) * d_h].double(), 2)
+                * torch.linalg.matrix_norm(blk.W_k.weight[h * d_h:(h + 1) * d_h].double(), 2)).item()
+               for h in range(blk.n_heads))
 
 
 def fixed_samples(dataset, n=N_SAMPLES):
@@ -244,10 +260,13 @@ def main():
     mc = model.config
     log.kv("run folder", run_dir)
     log.kv("device", f"{device}, {cfg['dtype']}")
-    log.kv("model", f"{cfg['task']}, {mc.mode}, {mc.backward}, {mc.n_heads} head{'s' if mc.n_heads > 1 else ''}")
+    log.kv("model", f"{cfg['task']}, {mc.mode}, {mc.backward}, {mc.n_heads} head{'s' if mc.n_heads > 1 else ''}, "
+                    f"tie {mc.tie_mode}")
     log.kv("size", f"d_model {mc.d_model}, n_tokens {mc.n_tokens}, n_context {mc.n_context}, "
                    f"params {sum(p.numel() for p in model.parameters()):,}")
     log.kv("loop", f"max_gradient_steps {mc.max_gradient_steps}, step_size {mc.step_size}")
+    log.kv("optimizer", f"{t['optimizer']}, lr {t['lr']}, batch {cfg['data']['batch_size']}, tie {t['tie_self']} / "
+                        f"{t['tie_cross']}, clip grad " + (f"at {t['clip_grad_norm']}" if t["clip_grad"] else "off"))
     log.kv("splits", ", ".join(f"{s} {len(d):,}" for s, d in datasets.items()))
     log.kv("test", f"{', '.join(test_splits)} ({'all samples' if test_size is None else f'{test_size} samples'}), "
                    f"loop {loop}, every {t['test_every']} {x_name}")
@@ -269,6 +288,7 @@ def main():
 
     def log_train(x):
         values, sec = window.mean()
+        values["theory/mu"] = self_attn_mu(model)                                 # at the end of the window
         run.log({x_name: x, **values})
         log.info(f"{x_name} {x} | train  {fmt(values)} | {sec:.3f} s/step")
 
@@ -304,7 +324,8 @@ def main():
                      f">= {100 * t['converge_frac']:g}%)")
 
     def step(batch):
-        window.add(train_step(model, optimizer, batch, train_set, device, dtype, t["tie_self"], t["tie_cross"]))
+        window.add(train_step(model, optimizer, batch, train_set, device, dtype, t["tie_self"], t["tie_cross"],
+                                clip_norm=t["clip_grad_norm"] if t["clip_grad"] else None))
 
     if ckpt is not None and args.resume:
         set_rng_state(ckpt["rng"])                                   # same data order as without the interruption

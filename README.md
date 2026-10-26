@@ -52,13 +52,15 @@ One file per task in `config/`; it holds everything that stays the same between 
 | `config/inverse.yaml` | matrix inverse | `ebm-inverse` |
 | `config/sudoku_rrn.yaml` | Sudoku (RRN) | `ebm-sudoku` |
 
-Per run, set these three keys on the command line with `--set` (dotted keys; only keys that exist in the yaml):
+Per run, set these keys on the command line with `--set` (dotted keys; only keys that exist in the yaml):
 
-| key | values |
-|---|---|
-| `model.mode` | `et` \| `forced` |
-| `model.backward` | `unroll` \| `ift` |
-| `model.n_heads` | `1` \| `8` |
+| key | values | default |
+|---|---|---|
+| `model.mode` | `et` \| `forced` | `et` |
+| `model.backward` | `unroll` \| `ift` | `unroll` |
+| `model.n_heads` | `1` \| `8` | `1` |
+| `model.tie_mode` | `orbit` \| `hard` (ablation: no W_v, W_o, exact gradient of E) | `orbit` |
+| `train.clip_grad` | `false` \| `true` (clip the gradient norm at `train.clip_grad_norm`, 1.0) | `false` |
 
 Any other key can be overridden the same way for a quick try, e.g. `--set train.lr=3e-4`.
 
@@ -75,8 +77,8 @@ python train.py --config config/<task>.yaml [--set key=value ...]
 | continue an interrupted run (same W&B run) | `python train.py --resume results/sudoku_rrn-et-unroll-1h` |
 | test run, nothing sent to W&B | add `wandb.mode=disabled` to `--set` (`offline`: keep locally, upload later with `wandb sync`) |
 
-- W&B: run `{mode}-{backward}-{n_heads}h` in the task's project.
-- Run folder `results/{task}-{mode}-{backward}-{n_heads}h` (`-2`, `-3`, … if taken):
+- W&B: run `{mode}-{backward}-{n_heads}h` in the task's project, with `-hard` appended for `model.tie_mode=hard`.
+- Run folder `results/{task}-{run name}`, e.g. `results/sudoku_rrn-et-unroll-1h` (`-2`, `-3`, … if taken):
   - `config.yaml`: full config with the seed
   - `train.log`: train / test lines, `% converged` of test_id, saved checkpoints
   - `checkpoints/latest_checkpoint.pt`: every epoch, for `--resume`
