@@ -18,6 +18,8 @@ data/**/raw/
 # tests and their logs - not in git
 tests/
 
+*.log
+
 # python
 __pycache__/
 *.pyc
