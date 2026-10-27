@@ -22,7 +22,8 @@ Done (Task 5.1-5.8, 6):
       (engine.test_loop); 4 fixed samples per split to a wandb.Table at each test (Task 4.3)
     - logged (Task 4.1, 4.2): train/loss (total), train/<metric>, train/grad_norm, train/last_local_dist (local dist
       at step max_gradient_steps of the training forward, mean), theory/mu (self-attention mu at the log),
-      theory/mu_penalty (max(0, mu - mu_max)^2, mean; only with train.mu_penalty > 0), tie/self_mse, tie/cross_mse,
+      theory/mu_penalty (max(0, mu - mu_max)^2, mean; only with train.mu_penalty > 0), theory/min_token_norm (v2:
+      min ||Z_hat_n|| / sqrt(d) at the last step of the training forward, mean of the batch minima), tie/self_mse, tie/cross_mse,
       ift/* (backward 'ift' only), test_id/loss, test_id/<metric>, test_ood/<metric>; s/step on the terminal only (5.7)
     - checkpoints (Task 6, utils/checkpoint.py), in <run>/checkpoints/:
         latest_checkpoint.pt every epoch (schedule 'epoch') / every test (schedule 'step'), overwritten
@@ -94,6 +95,7 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
         loss        float, the total loss (task + tie), logged as train/loss
         tie         dict {"self", "cross"}: R before the step (the values in the loss), logged as tie/self, tie/cross
         mu_penalty  float, max(0, mu - mu_max)^2 before the step (unweighted), or None when mu_coef = 0
+        min_token_norm  float, min over the batch and tokens of ||Z_hat_n|| / sqrt(d) at the last step (v2 trap)
         metric      dict, dataset.metric(model.predict(outputs), labels)   (Sudoku: board_acc, cell_acc; toy: mse)
         grad_norm   float
         steps, converged, local_dist, global_dist   (B,) tensors of the forward (see EnergyLoopModel.solve)
@@ -125,6 +127,7 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
         "metric": metric,
         "grad_norm": grad_norm.item(),
         **{k: out[k] for k in ("steps", "converged", "local_dist", "global_dist")},
+        "min_token_norm": min_token_norm(model, out["z_star"]),
         "backward": model.backward_info if model.config.backward == "ift" else None,
     }
 
@@ -158,6 +161,7 @@ class TrainWindow:
             self.values[f"train/{k}"].append(v)
         self.values["train/grad_norm"].append(r["grad_norm"])
         self.values["train/last_local_dist"].append(r["local_dist"].mean().item())   # ||Z_T - Z_{T-1}||, step T
+        self.values["theory/min_token_norm"].append(r["min_token_norm"])
         self.values["tie/self_mse"].append(r["tie"]["self"])
         self.values["tie/cross_mse"].append(r["tie"]["cross"])
         if r["mu_penalty"] is not None:
@@ -175,6 +179,14 @@ class TrainWindow:
         sec = (time.time() - self.t0) / max(n, 1)
         self.reset()
         return out, sec
+
+
+@torch.no_grad()
+def min_token_norm(model, z):
+    """min_n ||Z_n + P_Z,n|| / sqrt(d) over a batch (v2, pre-norm): the rms_norm factor sqrt(d) / ||z_hat_n|| is its
+    inverse; far below 1 = a token near 0, branches amplified (plans/Phase-C.5.md, Task 9.6, trap)."""
+    z_hat = z.detach() + model.core.pe_z()
+    return (z_hat.norm(dim=-1).min() / z_hat.shape[-1] ** 0.5).item()
 
 
 @torch.no_grad()
@@ -286,7 +298,7 @@ def main():
     log.kv("run folder", run_dir)
     log.kv("device", f"{device}, {cfg['dtype']}")
     log.kv("model", f"{cfg['task']}, {mc.mode}, {mc.backward}, {mc.n_heads} head{'s' if mc.n_heads > 1 else ''}, "
-                    f"tie {mc.tie_mode}")
+                    f"tie {mc.tie_mode}, context norm {'on' if mc.context_norm else 'off'}")
     log.kv("size", f"d_model {mc.d_model}, n_tokens {mc.n_tokens}, n_context {mc.n_context}, "
                    f"params {sum(p.numel() for p in model.parameters()):,}")
     log.kv("loop", f"max_gradient_steps {mc.max_gradient_steps}, step_size {mc.step_size}")

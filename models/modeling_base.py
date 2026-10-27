@@ -19,19 +19,28 @@ from models.blocks.mlp import MLPBlock
 from models.blocks.mlp import energy as mlp_energy
 from models.blocks.self_attn import ETSelfAttnBlock, ForcedSelfAttnBlock, et_energy, forced_energy
 from models.positional_encoding import PositionalEncoding
+from models.rms import rms_norm, rms_norm_vjp
 
 
 class LatentEnergyLayer(nn.Module):
     """Core latent: one energy layer, one update step = one gradient-descent step on E.
 
-    - energy (Z_hat = Z + P_Z at every step, X_tilde = X + P_X once):
-        E(Z; X) = rho/2 ||Z||^2 + phi_self(Z_hat) - gamma2 phi_cross(Z_hat; X_tilde) - alpha phi_mlp(Z_hat)
-      self enters with +: minimising E pushes similar tokens apart (anti-collapse); only rho/2 ||Z||^2 keeps the plain Z
+    - v2 (Phase C.5 Task 9.6): input injection + pre-norm inside the potentials
+    - energy (Z_hat = Z + P_Z, G = rms(Z_hat) at every step; X_bar = rms(X + P_X), or X + P_X with
+      context_norm False, once):
+        E(Z; X) = rho/2 ||Z - X_bar||^2 + phi_self(G) - gamma2 phi_cross(G; X_bar) - alpha phi_mlp(G)
+      rho/2 ||Z - X_bar||^2 = rho/2 ||Z||^2 - rho <Z, X_bar> + const: the linear term is the external field of a
+      Hopfield energy, i.e. the input injection W_x x of a Loop Transformer with W_x = I (docs/MOTIVATION.md §1);
+      it gives every token Z_n its own input X_bar_n (without it the fixed point carried no per-cell information)
+      self enters with +: minimising E pushes similar tokens apart (anti-collapse)
+    - pre-norm: the potentials see G = rms(Z_hat) (models/rms.py, no weight); rho/2 ||Z - X_bar||^2 stays on the
+      plain Z, so the step is still the exact gradient d E / d Z (not the g-frame of docs/FORMULATION.md §6)
     - one step Z <- Z - step_size * grad E:
-        Z_next = (1 - step_size * rho) Z + step_size * [ - self(Z_hat) + gamma2 cross(Z_hat, X_tilde) + alpha mlp(Z_hat) ]
-      each branch forward is the closed-form gradient of its potential
-    - no projection: E is bounded below and has a minimum when ||W_q|| ||W_k|| < 1/2 (summed over heads),
-      which the trunc_normal init gives (init_weights)
+        Z_next = (1 - step_size * rho) Z + step_size * [ rho X_bar
+                   + M^T ( - self(G) + gamma2 cross(G, X_bar) + alpha mlp(G) ) ]
+      M = d rms / d Z_hat (rms_norm_vjp); each branch forward is the closed-form gradient of its potential at G
+    - E is bounded below: the attention scores of G are bounded (|beta g A g'| <= beta ||A|| d), no mu < 1/2 needed
+    - needs n_tokens == n_context (injection X_bar_n -> Z_n)
     - mode: 'et' (ETSelfAttnBlock) or 'forced' (ForcedSelfAttnBlock); cross and mlp are the same in both
     - tie_mode: 'orbit' (default) or 'hard' (ablation), passed to the self and cross blocks
     - n_heads: heads of the self and cross blocks, d_h = d_model / n_heads, beta = 1 / sqrt(d_h) (Task 6);
@@ -40,9 +49,12 @@ class LatentEnergyLayer(nn.Module):
     """
 
     def __init__(self, d_model, n_tokens, n_context, mode="et", tie_mode="orbit",
-                 rho=1.0, gamma2=1.0, alpha=1.0, step_size=0.5, mlp_ratio=4, beta=None, n_heads=1):
+                 rho=1.0, gamma2=1.0, alpha=1.0, step_size=0.5, mlp_ratio=4, beta=None, n_heads=1,
+                 context_norm=True):
         super().__init__()
         assert mode in ("et", "forced"), f"mode is {mode}"
+        assert n_tokens == n_context, f"input injection needs n_tokens == n_context, got {n_tokens}, {n_context}"
+        self.context_norm = context_norm
         self.mode = mode
         self.d_model = d_model
         self.n_heads = n_heads
@@ -97,40 +109,46 @@ class LatentEnergyLayer(nn.Module):
         return {"self": self.self_attn.tie_penalty(), "cross": self.cross_attn.tie_penalty()}
 
     def add_context_pe(self, context):
-        """X_tilde = X + P_X, computed once before the loop (X is fixed).
+        """X_bar, computed once before the loop (X is fixed): rms(X + P_X) with context_norm, else X + P_X.
 
+        - used twice: the injection target of rho/2 ||Z - X_bar||^2 and the keys / values of cross-attention
+        - context_norm: every X_bar_n has norm sqrt(d), so the fixed point Z* ~ X_bar keeps the tokens away from 0
+          (the trap of rms_norm_vjp) and the cross keys do not drift with the embedding
         - context: (B, N_x, d) -> (B, N_x, d)
         """
-        return context + self.pe_x()
+        x = context + self.pe_x()
+        return rms_norm(x) if self.context_norm else x
 
     def forward_step(self, z, context_pe):
-        """One update step Z <- Z - step_size * grad E.
+        """One update step Z <- Z - step_size * grad E (exact gradient, closed form).
 
         - z: (B, N, d), the state
-        - context_pe: (B, N_x, d), X_tilde = X + P_X (from add_context_pe)
+        - context_pe: (B, N_x, d), X_bar (from add_context_pe)
         - returns: (B, N, d)
         """
         z_hat = z + self.pe_z()                                            # Z_hat = Z + P_Z   (B, N, d)
-        self_term = self.self_attn(z_hat)                                  # grad phi_self(Z_hat)
-        cross_term = self.cross_attn(z_hat, context_pe)                    # grad phi_cross(Z_hat; X_tilde)
-        mlp_term = self.mlp(z_hat)                                         # grad phi_mlp(Z_hat)
+        g = rms_norm(z_hat)                                                # G = rms(Z_hat)    (B, N, d)
+        self_term = self.self_attn(g)                                      # grad_G phi_self(G)
+        cross_term = self.cross_attn(g, context_pe)                        # grad_G phi_cross(G; X_bar)
+        mlp_term = self.mlp(g)                                             # grad_G phi_mlp(G)
         branches = - self_term + self.gamma2 * cross_term + self.alpha * mlp_term          # self: + in E, so - here
-        return (1 - self.step_size * self.rho) * z + self.step_size * branches
+        return ((1 - self.step_size * self.rho) * z
+                + self.step_size * (self.rho * context_pe + rms_norm_vjp(z_hat, branches)))   # M^T: chain rule
 
     def get_energy(self, z, context_pe):
-        """Energy E(Z; X), one value per sample (models/theory/layer.md §2).
+        """Energy E(Z; X), one value per sample.
 
-        - E = rho/2 ||Z||^2 + phi_self(Z_hat) - gamma2 phi_cross(Z_hat; X_tilde) - alpha phi_mlp(Z_hat)
+        - E = rho/2 ||Z - X_bar||^2 + phi_self(G) - gamma2 phi_cross(G; X_bar) - alpha phi_mlp(G), G = rms(Z + P_Z)
         - the potentials use W_q W_k^T (the theory), not W_v, W_o
-        - z: (B, N, d); context_pe: (B, N_x, d), X_tilde = X + P_X
+        - z: (B, N, d); context_pe: (B, N_x, d), X_bar
         - returns: (B,)
         """
-        z_hat = z + self.pe_z()
+        g = rms_norm(z + self.pe_z())
         self_energy = et_energy if self.mode == "et" else forced_energy
-        return (0.5 * self.rho * z.pow(2).sum(dim=(-2, -1))
-                + self_energy(self.self_attn, z_hat)
-                - self.gamma2 * cross_energy(self.cross_attn, z_hat, context_pe)
-                - self.alpha * mlp_energy(self.mlp, z_hat))
+        return (0.5 * self.rho * (z - context_pe).pow(2).sum(dim=(-2, -1))
+                + self_energy(self.self_attn, g)
+                - self.gamma2 * cross_energy(self.cross_attn, g, context_pe)
+                - self.alpha * mlp_energy(self.mlp, g))
 
     @torch.no_grad()
     def descend(self, z0, context_pe, tol=1e-5, max_steps=100):
@@ -229,6 +247,7 @@ class EnergyLoopConfig:
     step_size: float = 0.75
     beta: float | None = None
     mlp_ratio: int = 4
+    context_norm: bool = True                # v2: X_bar = rms(X + P_X); False: X + P_X
     backward: str = "unroll"
     max_gradient_steps: int = 100
     fwd_tol: float = 1e-5                    # 1e-5, not 1e-7: training is float32, local dist floor ~5e-7 (C.5 Task 6)
@@ -246,7 +265,7 @@ class EnergyLoopModel(nn.Module):
 
     - forward(inputs, labels=None):
         X       = encoder(inputs)                       (B, N_x, d)
-        X_tilde = X + P_X                                (once, core.add_context_pe)
+        X_tilde = rms(X + P_X) (X_bar; context_norm)     (once, core.add_context_pe)
         Z0      = init_state(B)                          (B, N, d)
         Z*      = loop Z <- step(Z) = core.forward_step(Z, X_tilde)
                     grad + 'unroll': solve_unroll; grad + 'ift': solve_fixed_point then implicit_step;
@@ -266,7 +285,7 @@ class EnergyLoopModel(nn.Module):
         self.core = LatentEnergyLayer(c.d_model, c.n_tokens, c.n_context, mode=c.mode, tie_mode=c.tie_mode,
                                       rho=c.rho, gamma2=c.gamma2, alpha=c.alpha,
                                       step_size=c.step_size, mlp_ratio=c.mlp_ratio, beta=c.beta,
-                                      n_heads=c.n_heads)
+                                      n_heads=c.n_heads, context_norm=c.context_norm)
         self.encoder = self.build_encoder()
         self.decoder = self.build_decoder()
         self.init_encoder_decoder()

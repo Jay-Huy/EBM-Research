@@ -91,10 +91,11 @@ def pick_seed():
 def run_name(cfg):
     """W&B run name inside the task's project: '{mode}-{backward}-{n_heads}h', e.g. 'et-unroll-1h';
     '-hard' appended with model.tie_mode 'hard' (no W_v, W_o), e.g. 'et-unroll-1h-hard';
-    '-mu{train.mu_penalty}' appended when the mu penalty is on, e.g. 'et-unroll-1h-mu10'."""
+    '-mu{train.mu_penalty}' appended when the mu penalty is on, e.g. 'et-unroll-1h-mu10';
+    '-xraw' appended with model.context_norm false (v2: X + P_X not normalised), e.g. 'et-unroll-1h-xraw'."""
     m, mu = cfg["model"], cfg.get("train", {}).get("mu_penalty", 0)
     return (f"{m['mode']}-{m['backward']}-{m['n_heads']}h" + ("-hard" if m.get("tie_mode") == "hard" else "")
-            + (f"-mu{mu:g}" if mu else ""))
+            + (f"-mu{mu:g}" if mu else "") + ("-xraw" if m.get("context_norm", True) is False else ""))
 
 
 def make_run_dir(cfg, root=RESULTS_DIR):

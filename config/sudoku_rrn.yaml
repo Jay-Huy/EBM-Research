@@ -10,6 +10,7 @@ model:                       # passed to build_model(task, **model)
   backward: unroll           # unroll | ift                (per run, --set)
   n_heads: 1                 # 1 | 8                       (per run, --set)
   tie_mode: orbit            # orbit | hard (ablation: no W_v, W_o; exact gradient of E) (per run, --set)
+  context_norm: true         # v2: X_bar = rms(X + P_X) (injection target and cross keys); false: X + P_X (per run, --set)
   step_size: 0.75
   max_gradient_steps: 16      # T: steps of the loop in training (unroll) and in fixed_steps inference
 
@@ -37,6 +38,6 @@ train:
   converge_frac: 0.99        # convergence_checkpoint.pt (unroll runs) once this fraction of test_id converges
 
 wandb:
-  project: ebm-sudoku
+  project: ebm-sudoku-v2
   entity: null               # null: personal account
   mode: online               # online | offline | disabled (test runs: --set wandb.mode=disabled)
