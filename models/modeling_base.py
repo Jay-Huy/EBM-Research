@@ -64,7 +64,7 @@ class LatentEnergyLayer(nn.Module):
 
         - trunc_normal for every nn.Linear: std = c / sqrt(d_model), truncated at +-3 std
           (c = 1/4: ||W_q|| ||W_k|| ~ 4 c^2 = 1/4 < 1/2 by RMT, the condition of Theorem 3.1)
-        - trunc_normal (std 0.02) for P_Z, P_X
+        - trunc_normal (std 1.0, the scale of the embedding and Z0) for P_Z, P_X
         - Forced: retract once, so every A_h = W_q^h W_k^h^T is symmetric (models/theory/retraction.md); no-op for ET
         - init_tie of the self and cross blocks, last (so the weight init does not overwrite W_v, W_o)
         """
