@@ -210,11 +210,11 @@ class EnergyLoopConfig:
     - backward ('unroll' | 'ift'): how the gradient goes through the loop when grad is enabled (Task 5.2)
         unroll: exactly max_gradient_steps steps with grad, backprop through every step
         ift:    forward without grad to a fixed point (fwd_tol, fwd_max_steps), one step with grad,
-                then (I - J^T) u = grad_{Z*} L solved by fixed-point iteration (bwd_tol, bwd_max_steps)
+                then (I - J^T) u = grad_{Z*} L solved by conjugate gradient (bwd_tol, bwd_max_steps)
       switch at any time with model.config.backward = ...
     - forward without grad (inference, and the forward of 'ift'): a sample stops when its local dist
       ||Z_{t+1} - Z_t||_F < fwd_tol, at most fwd_max_steps steps
-    - backward of 'ift': stops when ||u_{k+1} - u_k|| < bwd_tol ||u_{k+1}|| for every sample, at most bwd_max_steps
+    - backward of 'ift': stops when ||g - (I - J^T) u|| < bwd_tol ||g|| for every sample, at most bwd_max_steps
     - z0_init: 'trunc_normal' N(0, 1) truncated at +-3 std (decided, Task 3.3), or 'uniform' U(-1, 1)
     """
     d_model: int
@@ -234,7 +234,7 @@ class EnergyLoopConfig:
     fwd_tol: float = 1e-5                    # 1e-5, not 1e-7: training is float32, local dist floor ~5e-7 (C.5 Task 6)
     fwd_max_steps: int = 200                 # 200, not 2000: inference to the fixed point (C.5 Task 9)
     bwd_tol: float = 1e-5
-    bwd_max_steps: int = 200
+    bwd_max_steps: int = 300                 # CG iterations of the IFT backward (Phase C.5 Task 9.8)
     z0_init: str = "trunc_normal"
 
     def to_dict(self):
@@ -363,10 +363,17 @@ class EnergyLoopModel(nn.Module):
         - Y = T(Z*) with Z* detached: the graph goes only into theta and X_tilde
         - a hook on Y replaces the incoming gradient g = grad_{Z*} L by u, the solution of (I - J^T) u = g,
           J = dT/dZ at Z*; then autograd continues: dL/dtheta = (dT/dtheta)^T u, dL/dX_tilde = (dT/dX_tilde)^T u
-        - u by fixed-point iteration u <- J^T u + g, u_0 = g; J^T v = one VJP through a second copy of the step
-          F = T(Z_s) with Z_s = Z* (requires grad) and X_tilde detached; never builds J
-        - stops when ||u_{k+1} - u_k|| < bwd_tol ||u_{k+1}|| for every sample, or after bwd_max_steps;
-          writes self.backward_info = {"iters", "residual" (B,), "converged" (B,)}
+        - u by conjugate gradient (CG) on (I - J^T) u = g, u_0 = 0, batched per sample; (I - J^T) v = v - J^T v,
+          J^T v = one VJP through a second copy of the step F = T(Z_s) with Z_s = Z* (requires grad) and X_tilde
+          detached; never builds J
+        - why CG (Phase C.5 Task 9.8): I - J^T = step_size * Hessian(E) at Z*, symmetric (exact for tie 'hard',
+          up to the tie error for 'orbit') and positive definite where E is strongly convex; CG needs only that,
+          not the contraction ||J|| < 1 (step_size < 2/L) of the old fixed-point iteration u <- J^T u + g, which
+          stalls when the smallest Hessian eigenvalue is small (spectral radius ~0.97: residual 4e-4 after 200
+          iterations, CG 6e-7 after 50) and blows up when one sample has step_size > 2/L
+        - a sample stops when ||g - (I - J^T) u|| < bwd_tol ||g||; also (not converged) if p^T (I - J^T) p <= 0
+          (no positive curvature: CG is not defined there, u keeps its last value); at most bwd_max_steps
+        - writes self.backward_info = {"iters", "residual" (B,) = ||g - (I - J^T) u|| / ||g||, "converged" (B,)}
         - returns Y (B, N, d), to feed the decoder
         """
         c = self.config
@@ -378,18 +385,36 @@ class EnergyLoopModel(nn.Module):
         f = self.step(z_s, x_tilde.detach())
 
         def solve_u(g):
-            u = g
-            iters, residual = 0, torch.zeros(g.shape[0], dtype=g.dtype, device=g.device)
-            done = torch.zeros(g.shape[0], dtype=torch.bool, device=g.device)
+            def apply(v):                                                  # (I - J^T) v
+                return v - torch.autograd.grad(f, z_s, v, retain_graph=True)[0]
+
+            def dot(a, b):                                                 # per-sample inner product, (B,)
+                return (a * b).flatten(1).sum(-1)
+
+            tiny = torch.finfo(g.dtype).tiny
+            g_norm = dot(g, g).sqrt().clamp_min(tiny)
+            u, r = torch.zeros_like(g), g.clone()
+            p, rs = r.clone(), dot(r, r)
+            done = rs.sqrt() < c.bwd_tol * g_norm
+            stuck = torch.zeros_like(done)                                 # p^T A p <= 0: CG cannot continue
+            iters = 0
             for k in range(c.bwd_max_steps):
-                u_next = torch.autograd.grad(f, z_s, u, retain_graph=True)[0] + g
-                residual = (u_next - u).flatten(1).norm(dim=-1) / u_next.flatten(1).norm(dim=-1).clamp_min(1e-300)
-                u = u_next
-                iters = k + 1
-                done = residual < c.bwd_tol
-                if bool(done.all()):
+                if bool((done | stuck).all()):
                     break
-            self.backward_info = {"iters": iters, "residual": residual.detach(), "converged": done}
+                Ap = apply(p)
+                pAp = dot(p, Ap)
+                stuck = stuck | (~done & (pAp <= 0))
+                active = ~done & ~stuck
+                alpha = torch.where(active, rs / torch.where(active, pAp, torch.ones_like(pAp)), torch.zeros_like(rs))
+                u = u + alpha.view(-1, 1, 1) * p
+                r = r - alpha.view(-1, 1, 1) * Ap
+                rs_new = dot(r, r)
+                beta = torch.where(active, rs_new / rs.clamp_min(tiny), torch.zeros_like(rs))
+                p = torch.where(active.view(-1, 1, 1), r + beta.view(-1, 1, 1) * p, p)
+                rs = torch.where(active, rs_new, rs)
+                done = done | (rs.sqrt() < c.bwd_tol * g_norm)
+                iters = k + 1
+            self.backward_info = {"iters": iters, "residual": (rs.sqrt() / g_norm).detach(), "converged": done}
             return u
 
         y.register_hook(solve_u)
