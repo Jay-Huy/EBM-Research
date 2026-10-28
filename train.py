@@ -27,7 +27,7 @@ Done (Task 5.1-5.8, 6):
       ift/* (backward 'ift' only), test_id/loss, test_id/<metric>, test_ood/<metric>; s/step on the terminal only (5.7)
     - checkpoints (Task 6, utils/checkpoint.py), in <run>/checkpoints/:
         latest_checkpoint.pt every epoch (schedule 'epoch') / every test (schedule 'step'), overwritten
-        best_checkpoint.pt when the test_id metric (dataset BEST_METRIC: Sudoku board_acc, toy mse) beats the best
+        best_checkpoint.pt when test_id/<BEST_METRIC> (dataset BEST_METRIC: Sudoku loss, toy mse) beats the best
         convergence_checkpoint.pt once (backward 'unroll' only): test_id runs one pass of train.converge_steps steps
           (loss / metric read at max_gradient_steps); saved when >= converge_frac of test_id has local dist
           < converge_tol within those steps; the % is printed at every test

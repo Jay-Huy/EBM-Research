@@ -47,7 +47,7 @@ class SudokuRRN(BaseDataset):
     """
 
     SPLITS = ("train", "test_id")
-    BEST_METRIC = ("board_acc", "max")
+    BEST_METRIC = ("loss", "min")            # test_id/loss: board_acc stays 0 for long, so only epoch 1 was saved
     PLOT_METRIC = ({"board_acc": "Board", "cell_acc": "Cell"}, "Accuracy", "Acc (%)", (0, 100))
     input_len = 81
     output_len = 81

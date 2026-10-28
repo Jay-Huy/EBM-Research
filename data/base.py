@@ -10,7 +10,8 @@ Every dataset subclasses `BaseDataset` and defines:
     - sample_scores(pred, labels) -> dict of (B,) tensors, metric_from_scores(scores) -> dict : the same metric from
                     per-sample sums, so inference.py gets the exact split metric at every step without keeping the
                     predictions of every step (Phase C.5 Task 8)
-    - BEST_METRIC : (metric key, "max" | "min"), the test_id metric that picks best_checkpoint.pt (Phase C.5 Task 6)
+    - BEST_METRIC : (key, "max" | "min"), test_id/<key> that picks best_checkpoint.pt: a metric key or "loss"
+                    (Phase C.5 Task 6; Sudoku: loss, Task 9.8)
     - PLOT_METRIC : ({metric key: line label}, panel title, axis label, y limits or None), the metric lines drawn by
                     inference.py (curves.png); the first key is the main one (drawn on top, bold)
     - format_sample(inputs, pred, labels) -> dict | None : one sample as text for the W&B sample table
