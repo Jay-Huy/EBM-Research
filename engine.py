@@ -11,7 +11,17 @@
   the cross cases (unroll checkpoint at fixed_point, ift checkpoint at fixed steps) are for eval.py
 - task metrics come from each dataset's metric() (data/), not from here
 """
+import sys
+
 import torch
+from tqdm import tqdm
+
+
+def progress(iterable, desc, total=None):
+    """tqdm progress bar (stderr), removed when done; on a terminal it refreshes every second, in a file (Kaggle,
+    nohup) every 30 s so the file does not fill up."""
+    return tqdm(iterable, desc=desc, total=total, leave=False, dynamic_ncols=True,
+                mininterval=1 if sys.stderr.isatty() else 30)
 
 
 def test_loop(model):
@@ -66,10 +76,11 @@ def pad_steps(x, length, fill_last):
 
 
 @torch.no_grad()
-def run_inference(model, batches, dataset, loop="fixed_steps", converge=None, record=False, save_z=False):
+def run_inference(model, batches, dataset, loop="fixed_steps", converge=None, record=False, save_z=False, desc=None):
     """Run the model without grad on batches of one split; returns the task loss and the metric of the whole split.
 
     - batches: iterable of {"inputs", "labels"} (a DataLoader)
+    - desc: None, or the label of a tqdm progress bar over the batches (train.py test)
     - loop: 'fixed_steps' | 'fixed_point' (EnergyLoopModel.solve)
     - converge: None, or (steps, tol) with loop 'fixed_steps' (Task 6): one pass of `steps` (>= max_gradient_steps)
       steps from the same Z0; outputs, loss, metric are taken at step max_gradient_steps (as without converge);
@@ -94,7 +105,7 @@ def run_inference(model, batches, dataset, loop="fixed_steps", converge=None, re
     T = model.config.max_gradient_steps
     loss_sum, n, n_conv, preds, labels = 0.0, 0, 0, [], []
     rec = {k: [] for k in ("steps_to_converge", "local", "glob", "energy", "scores", "z")}
-    for batch in batches:
+    for batch in (batches if desc is None else progress(batches, desc)):
         batch = to_device(batch, p.device, p.dtype)
         b = batch["inputs"].shape[0]
         if record:

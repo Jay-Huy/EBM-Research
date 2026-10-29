@@ -8,14 +8,15 @@ dtype: float32
 model:                       # passed to build_model(task, **model)
   mode: et                   # et | forced                 (per run, --set)
   backward: unroll           # unroll | ift                (per run, --set)
-  n_heads: 1                 # 1 | 8                       (per run, --set)
-  tie_mode: orbit            # orbit | hard (ablation: no W_v, W_o; exact gradient of E) (per run, --set)
-  step_size: 0.75
-  max_gradient_steps: 16      # T: steps of the loop in training (unroll) and in fixed_steps inference
+  n_heads: 8                 # 1 | 8                       (per run, --set)
+  tie_mode: hard            # orbit | hard (ablation: no W_v, W_o; exact gradient of E) (per run, --set)
+  step_size: 0.1
+  step_mode: fixed           # fixed (step_size) | adaptive (0.95 * 2 / L per step and sample) (per run, --set)
+  max_gradient_steps: 6      # T: steps of the loop in training (unroll) and in fixed_steps inference
 
 data:
   batch_size: 16
-  test_batch_size: 100       # Task 5.5
+  test_batch_size: 25       # Task 5.5
   test_size: null            # test samples per split; null = the whole split (1000 for Sudoku)
 
 train:
@@ -25,12 +26,12 @@ train:
   lr: 1.0e-4
   betas: [0.9, 0.95]
   weight_decay: 0.1
-  test_every: 1              # in epochs (Task 5.5)
+  test_every: 2              # in epochs (Task 5.5)
   tie_self: 1.0              # coefficient of R_self in the loss (Task 5.2, tests/check_tie_scale.py)
   tie_cross: 1.0             # coefficient of R_cross in the loss (Task 5.2, tests/check_tie_scale.py)
-  clip_grad: false           # clip the total L2 norm of the gradient before optimizer.step() (off by default)
+  clip_grad: true           # clip the total L2 norm of the gradient before optimizer.step() (off by default)
   clip_grad_norm: 1.0        # max norm when clip_grad is true
-  mu_penalty: 0.0            # coefficient of max(0, mu - mu_max)^2 in the loss (Theorem 1: mu < 1/2); 0 = off
+  mu_penalty: 1.0            # coefficient of max(0, mu - mu_max)^2 in the loss (Theorem 1: mu < 1/2); 0 = off
   mu_max: 0.45               # threshold of the mu penalty (below 1/2 for a margin)
   converge_steps: 100        # test_id: one pass of this many steps; loss / metric read at max_gradient_steps (Task 6)
   converge_tol: 1.0e-5       # a sample converges if local dist < this within converge_steps

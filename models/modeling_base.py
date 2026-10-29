@@ -103,19 +103,85 @@ class LatentEnergyLayer(nn.Module):
         """
         return context + self.pe_x()
 
-    def forward_step(self, z, context_pe):
+    def forward_step(self, z, context_pe, step_size=None):
         """One update step Z <- Z - step_size * grad E.
 
         - z: (B, N, d), the state
         - context_pe: (B, N_x, d), X_tilde = X + P_X (from add_context_pe)
+        - step_size: None (self.step_size, fixed) or a (B, 1, 1) tensor, one step size per sample (step_mode 'adaptive')
         - returns: (B, N, d)
         """
+        eta = self.step_size if step_size is None else step_size
         z_hat = z + self.pe_z()                                            # Z_hat = Z + P_Z   (B, N, d)
         self_term = self.self_attn(z_hat)                                  # grad phi_self(Z_hat)
         cross_term = self.cross_attn(z_hat, context_pe)                    # grad phi_cross(Z_hat; X_tilde)
         mlp_term = self.mlp(z_hat)                                         # grad phi_mlp(Z_hat)
         branches = - self_term + self.gamma2 * cross_term + self.alpha * mlp_term          # self: + in E, so - here
-        return (1 - self.step_size * self.rho) * z + self.step_size * branches
+        return (1 - eta * self.rho) * z + eta * branches
+
+    def _hvp_fn(self, z, context_pe):
+        """Return (zz, H v function) for the Hessian of E at z: H v = d/dZ <grad E(Z), v> (double backward)."""
+        zz = z.detach().requires_grad_()
+        g, = torch.autograd.grad(self.get_energy(zz, context_pe.detach()).sum(), zz, create_graph=True)
+        return lambda v: torch.autograd.grad(g, zz, v, retain_graph=True)[0]
+
+    def hessian_lanczos(self, z, context_pe, v, iters):
+        """Largest Hessian eigenvalue of E at z per sample by Lanczos (step_mode 'adaptive', first step of a loop).
+
+        - samples are independent (E summed over the batch is block diagonal): one batched Lanczos, per-sample
+          coefficients; full re-orthogonalisation (iters vectors per sample)
+        - Lanczos, not power iteration: at init the spectrum is clustered ([0.80, 1.20] at d 768), where 10 power
+          iterations give L = 1.00 (step size 1.9, above 2 / 1.20) and Lanczos converges in a few iterations
+        - v: (B, N, d) start vector; returns L (B,) = largest Ritz value (a lower bound of the largest eigenvalue,
+          accurate for the extreme one) and its Ritz vector (B, N, d) for the warm start; detached
+        """
+        tiny = torch.finfo(z.dtype).tiny
+        B = z.shape[0]
+
+        def dot(a, b):
+            return (a * b).flatten(1).sum(-1)
+
+        with torch.enable_grad():
+            hvp = self._hvp_fn(z, context_pe)
+            v = v / dot(v, v).sqrt().clamp_min(tiny).view(-1, 1, 1)
+            V, alphas, betas = [v], [], []
+            for j in range(iters):
+                w = hvp(V[-1])
+                alphas.append(dot(w, V[-1]))
+                for u in V:                                                # full re-orthogonalisation
+                    w = w - dot(w, u).view(-1, 1, 1) * u
+                b = dot(w, w).sqrt()
+                betas.append(b)
+                if j + 1 < iters:
+                    V.append(w / b.clamp_min(tiny).view(-1, 1, 1))
+        k = len(alphas)
+        T = torch.zeros(B, k, k, dtype=z.dtype, device=z.device)
+        idx = torch.arange(k, device=z.device)
+        T[:, idx, idx] = torch.stack(alphas, 1)
+        if k > 1:
+            off = torch.stack(betas[:-1], 1)
+            T[:, idx[:-1], idx[1:]] = off
+            T[:, idx[1:], idx[:-1]] = off
+        evals, evecs = torch.linalg.eigh(T)                                # ascending
+        y = evecs[:, :, -1]                                                # (B, k)
+        ritz = sum(y[:, i].view(-1, 1, 1) * V[i] for i in range(k))
+        return evals[:, -1].detach(), ritz.detach()
+
+    def hessian_power(self, z, context_pe, v, iters):
+        """Power iteration on the Hessian of E at z, per sample (step_mode 'adaptive', warm-started steps).
+
+        - v: (B, N, d), the start vector (the vector of the previous loop step); iters: power iterations
+        - returns L (B,) = ||H v|| for the last unit v (a lower bound of ||H||) and the new v; both detached
+        """
+        tiny = torch.finfo(z.dtype).tiny
+        with torch.enable_grad():
+            hvp = self._hvp_fn(z, context_pe)
+            v = v / v.flatten(1).norm(dim=-1).clamp_min(tiny).view(-1, 1, 1)
+            for _ in range(iters):
+                hv = hvp(v)
+                L = hv.flatten(1).norm(dim=-1)
+                v = hv / L.clamp_min(tiny).view(-1, 1, 1)
+        return L.detach(), v.detach()
 
     def get_energy(self, z, context_pe):
         """Energy E(Z; X), one value per sample (models/theory/layer.md §2).
@@ -173,6 +239,10 @@ class LatentEnergyLayer(nn.Module):
 
 _REGISTRY = {}
 
+STEP_MARGIN = 0.95          # step_mode 'adaptive': step_size = STEP_MARGIN * 2 / L (JayR)
+LANCZOS_ITERS = 15          # Lanczos iterations at the first step of a loop (start vector: Z itself)
+POWER_ITERS = 1             # power iterations at the next steps (warm start from the previous step's vector)
+
 
 def register_model(name, **defaults):
     """Class decorator: register a model class under `name`, with its default config values (d_model, N, N_x, ...)."""
@@ -216,6 +286,10 @@ class EnergyLoopConfig:
       ||Z_{t+1} - Z_t||_F < fwd_tol, at most fwd_max_steps steps
     - backward of 'ift': stops when ||g - (I - J^T) u|| < bwd_tol ||g|| for every sample, at most bwd_max_steps
     - z0_init: 'trunc_normal' N(0, 1) truncated at +-3 std (decided, Task 3.3), or 'uniform' U(-1, 1)
+    - step_mode: 'fixed' (step_size at every step) or 'adaptive' (Phase C.5 Task 9.9): at every loop step, per sample,
+      step_size = 0.95 * 2 / L with L = largest eigenvalue of the Hessian of E at the current Z (Lanczos, 15
+      iterations, at the first step of a loop; then 1 warm-started power iteration per step; L = running max over the
+      loop); step_size is then ignored
     """
     d_model: int
     n_tokens: int
@@ -236,6 +310,7 @@ class EnergyLoopConfig:
     bwd_tol: float = 1e-5
     bwd_max_steps: int = 300                 # CG iterations of the IFT backward (Phase C.5 Task 9.8)
     z0_init: str = "trunc_normal"
+    step_mode: str = "fixed"                 # fixed | adaptive (0.95 * 2 / L per step and sample, Task 9.9)
 
     def to_dict(self):
         return asdict(self)
@@ -271,6 +346,9 @@ class EnergyLoopModel(nn.Module):
         self.decoder = self.build_decoder()
         self.init_encoder_decoder()
         self.backward_info = None
+        self._power_v = None                    # step_mode 'adaptive': power-iteration vector of the current loop
+        self._power_L = None                    # step_mode 'adaptive': running max of L over the current loop
+        self.last_step_size = None              # step_mode 'adaptive': (B,) step size of the last step
 
     # --- subclass hooks ---------------------------------------------------------------------------------------------
     def build_encoder(self):
@@ -294,7 +372,8 @@ class EnergyLoopModel(nn.Module):
 
     # --- shared -----------------------------------------------------------------------------------------------------
     def init_state(self, batch_size):
-        """Z0, (B, N, d): N(0, 1) truncated at +-3 std, or U(-1, 1)."""
+        """Z0, (B, N, d): N(0, 1) truncated at +-3 std, or U(-1, 1). Starts a new loop (resets the adaptive step)."""
+        self._power_v = None
         w = self.core.pe_z.weight
         shape = (batch_size, self.config.n_tokens, self.config.d_model)
         if self.config.z0_init == "trunc_normal":
@@ -305,8 +384,31 @@ class EnergyLoopModel(nn.Module):
         raise ValueError(f"z0_init is {self.config.z0_init}")
 
     def step(self, z, x_tilde):
-        """One update step T(Z) = core.forward_step(Z, X_tilde) = Z - step_size grad E(Z), (B, N, d)."""
-        return self.core.forward_step(z, x_tilde)
+        """One update step T(Z) = core.forward_step(Z, X_tilde) = Z - step_size grad E(Z), (B, N, d).
+
+        - step_mode 'fixed': step_size of the config
+        - step_mode 'adaptive': step_size = STEP_MARGIN * 2 / L per sample; L at Z by core.hessian_lanczos at the
+          first step of a loop (init_state starts a new loop), then by one warm-started power iteration
+          (core.hessian_power from the previous vector); L is the running max over
+          the steps of the loop (a warm-started power iteration underestimates L after a large move of Z), so the
+          step size never grows inside a loop; self.last_step_size (B,)
+        """
+        if self.config.step_mode == "fixed":
+            return self.core.forward_step(z, x_tilde)
+        if self.config.step_mode != "adaptive":
+            raise ValueError(f"step_mode is {self.config.step_mode}")
+        first = self._power_v is None or self._power_v.shape != z.shape
+        v = z.detach() if first else self._power_v
+        if first:
+            L, self._power_v = self.core.hessian_lanczos(z, x_tilde, v, LANCZOS_ITERS)
+        else:
+            L, self._power_v = self.core.hessian_power(z, x_tilde, v, POWER_ITERS)
+        if not first:                       # running max over the loop: the warm-started estimate is a lower bound
+            L = torch.maximum(L, self._power_L)
+        self._power_L = L
+        eta = STEP_MARGIN * 2 / L.clamp_min(torch.finfo(L.dtype).tiny)
+        self.last_step_size = eta
+        return self.core.forward_step(z, x_tilde, step_size=eta.view(-1, 1, 1))
 
     @staticmethod
     def _info(z, z0, steps, local):

@@ -45,7 +45,7 @@ from torch.utils.data import DataLoader
 import data  # noqa: F401  (registers the datasets)
 import models
 from data.base import get_dataset
-from engine import run_inference, test_loop, to_device
+from engine import progress, run_inference, test_loop, to_device
 from utils.checkpoint import (BEST, CHECKPOINT_DIR, CONVERGENCE, LATEST, load_checkpoint, save_checkpoint,
                               set_rng_state)
 from utils.config import load_config, make_run_dir, pick_seed, save_config
@@ -98,6 +98,7 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
         grad_norm   float
         steps, converged, local_dist, global_dist   (B,) tensors of the forward (see EnergyLoopModel.solve)
         backward    model.backward_info (iters, residual (B,), converged (B,)) with backward 'ift', else None
+        step_size   float, mean step size of the last loop step with step_mode 'adaptive', else None
     """
     model.train()
     batch = to_device(batch, device, dtype)
@@ -126,6 +127,7 @@ def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cr
         "grad_norm": grad_norm.item(),
         **{k: out[k] for k in ("steps", "converged", "local_dist", "global_dist")},
         "backward": model.backward_info if model.config.backward == "ift" else None,
+        "step_size": model.last_step_size.mean().item() if model.config.step_mode == "adaptive" else None,
     }
 
 
@@ -158,6 +160,8 @@ class TrainWindow:
             self.values[f"train/{k}"].append(v)
         self.values["train/grad_norm"].append(r["grad_norm"])
         self.values["train/last_local_dist"].append(r["local_dist"].mean().item())   # ||Z_T - Z_{T-1}||, step T
+        if r["step_size"] is not None:
+            self.values["theory/step_size"].append(r["step_size"])                  # adaptive: 0.95 * 2 / L, last step
         self.values["tie/self_mse"].append(r["tie"]["self"])
         self.values["tie/cross_mse"].append(r["tie"]["cross"])
         if r["mu_penalty"] is not None:
@@ -289,7 +293,8 @@ def main():
                     f"tie {mc.tie_mode}")
     log.kv("size", f"d_model {mc.d_model}, n_tokens {mc.n_tokens}, n_context {mc.n_context}, "
                    f"params {sum(p.numel() for p in model.parameters()):,}")
-    log.kv("loop", f"max_gradient_steps {mc.max_gradient_steps}, step_size {mc.step_size}")
+    log.kv("loop", f"max_gradient_steps {mc.max_gradient_steps}, step_size "
+                   + (f"{mc.step_size}" if mc.step_mode == "fixed" else "adaptive (0.95 * 2 / L per step and sample)"))
     log.kv("optimizer", f"{t['optimizer']}, lr {t['lr']}, batch {cfg['data']['batch_size']}, tie {t['tie_self']} / "
                         f"{t['tie_cross']}, clip grad " + (f"at {t['clip_grad_norm']}" if t["clip_grad"] else "off")
                         + ", mu penalty " + (f"{mu_coef:g} at mu > {mu_max:g}" if mu_coef > 0 else "off"))
@@ -323,7 +328,8 @@ def main():
         values, converged = {}, None
         for s in test_splits:
             converge = (t["converge_steps"], t["converge_tol"]) if s == "test_id" and loop == "fixed_steps" else None
-            r = run_inference(model, test_loaders[s], datasets[s], loop=loop, converge=converge)
+            r = run_inference(model, test_loaders[s], datasets[s], loop=loop, converge=converge,
+                              desc=f"{x_name} {x} test {s}")
             if s != "test_ood":                                      # test OOD: metric only (Task 4.1)
                 values[f"{s}/loss"] = r["loss"]
             values.update({f"{s}/{k}": v for k, v in r["metric"].items()})
@@ -360,16 +366,20 @@ def main():
     if t["schedule"] == "epoch":
         loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
         for epoch in range(start, t["epochs"] + 1):
-            for batch in loader:
+            bar = progress(loader, f"epoch {epoch}/{t['epochs']} train")
+            for batch in bar:
                 step(batch)
+                bar.set_postfix(loss=f"{window.values['train/loss'][-1]:.4f}", refresh=False)
             log_train(epoch)
             if t["test_every"] and epoch % t["test_every"] == 0:
                 test(epoch)
             save(LATEST, epoch)
     elif t["schedule"] == "step":
         batches = iter(DataLoader(train_set, batch_size=batch_size))   # data drawn on the fly, len 1e7
-        for it in range(start, t["iterations"] + 1):
+        bar = progress(range(start, t["iterations"] + 1), "train", total=t["iterations"] - start + 1)
+        for it in bar:
             step(next(batches))
+            bar.set_postfix(loss=f"{window.values['train/loss'][-1]:.4f}", refresh=False)
             if it % LOG_EVERY == 0:
                 log_train(it)
             if t["test_every"] and it % t["test_every"] == 0:
