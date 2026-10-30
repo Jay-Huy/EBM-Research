@@ -40,4 +40,4 @@ class SudokuModel(EnergyLoopModel):
         return outputs.argmax(dim=-1)
 
 
-register_model("sudoku_rrn", d_model=512, n_tokens=81, n_context=81)(SudokuModel)
+register_model("sudoku_rrn", d_model=768, n_tokens=81, n_context=81)(SudokuModel)
