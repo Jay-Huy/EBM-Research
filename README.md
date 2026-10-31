@@ -9,7 +9,7 @@ EBM Research/
 ├── config/                  # one <task>.yaml per run setup: model, dataset, training
 ├── models/                  # energy model: ET and Forced
 │   ├── blocks/              # branches: mlp, cross-attention, self-attention; heads.py (multi-head helpers)
-│   ├── tasks/               # task models: encoder / decoder / loss per task (matrix, sudoku)
+│   ├── tasks/               # task models: encoder / decoder / loss per task (matrix, sudoku, cifar)
 │   ├── positional_encoding.py
 │   └── modeling_base.py     # core latent, base model, config, registry
 ├── utils/                   # shared utilities
@@ -36,7 +36,7 @@ EBM Research/
 ## Setup
 
 ```
-pip install pyyaml wandb
+pip install pyyaml wandb tqdm torchvision
 wandb login          # once per machine; the API key is never stored in the repo
 ```
 
@@ -51,6 +51,8 @@ One file per task in `config/`; it holds everything that stays the same between 
 | `config/lowrank.yaml` | low-rank completion | `ebm-lowrank` |
 | `config/inverse.yaml` | matrix inverse | `ebm-inverse` |
 | `config/sudoku_rrn.yaml` | Sudoku (RRN) | `ebm-sudoku` |
+| `config/cifar10.yaml` | CIFAR-10 classification (Hyper-SET setup: patch 8, batch 128, 200 epochs, cosine lr) | `ebm-cifar10` |
+| `config/cifar100.yaml` | CIFAR-100 classification (same setup) | `ebm-cifar100` |
 
 Per run, set these keys on the command line with `--set` (dotted keys; only keys that exist in the yaml):
 

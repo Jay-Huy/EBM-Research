@@ -10,6 +10,9 @@ Run:
 
 Done (Task 5.1-5.8, 6):
     - build_optimizer(model, cfg): adam | adamw from cfg["train"] (lr, betas, weight_decay)
+    - lr_at, set_lr: learning-rate schedule from cfg["train"]: lr_schedule 'none' (lr) | 'cosine' (warmup, then cosine
+      to min_lr; warmup in epochs / steps by train.schedule), set before every step; logged as train/lr (Task 9.10)
+    - data.num_workers (default 0): DataLoader workers of the train set (CIFAR: augmentation on the CPU)
     - train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross): one optimizer step on one batch,
       loss = task loss + tie_self * R_self + tie_cross * R_cross (tie coefficients from cfg["train"])
       + mu_penalty * max(0, mu - mu_max)^2 (soft constraint mu < 1/2 of Theorem 1; train.mu_penalty, 0 = off);
@@ -32,6 +35,7 @@ Done (Task 5.1-5.8, 6):
           < converge_tol within those steps; the % is printed at every test
 """
 import argparse
+import math
 import random
 import time
 from collections import defaultdict
@@ -76,6 +80,29 @@ def mu_penalty(model, mu_max):
              * torch.linalg.matrix_norm(blk.W_k.weight[h * d_h:(h + 1) * d_h], 2)
              for h in range(blk.n_heads))
     return torch.relu(mu - mu_max) ** 2, mu.detach()
+
+
+def lr_at(t, step, total, warmup):
+    """Learning rate at a training step (0-based), from cfg["train"] (Phase C.5 Task 9.10).
+
+    - train.lr_schedule 'none' (default; absent in older configs): train.lr at every step
+    - 'cosine' (as Hyper-SET, CIFAR): linear warmup from lr / warmup to lr over `warmup` steps, then cosine decay
+      from train.lr to train.min_lr at the last step `total` - 1
+    - computed from the step index, not stored: --resume gives the same schedule
+    """
+    if t.get("lr_schedule", "none") == "none":
+        return t["lr"]
+    if t["lr_schedule"] != "cosine":
+        raise ValueError(f"train.lr_schedule is {t['lr_schedule']}")
+    if step < warmup:
+        return t["lr"] * (step + 1) / warmup
+    progress = min(1.0, (step - warmup) / max(1, total - 1 - warmup))
+    return t["min_lr"] + (t["lr"] - t["min_lr"]) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def set_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 def train_step(model, optimizer, batch, dataset, device, dtype, tie_self, tie_cross, clip_norm=None,
@@ -295,7 +322,9 @@ def main():
                    f"params {sum(p.numel() for p in model.parameters()):,}")
     log.kv("loop", f"max_gradient_steps {mc.max_gradient_steps}, step_size "
                    + (f"{mc.step_size}" if mc.step_mode == "fixed" else "adaptive (0.95 * 2 / L per step and sample)"))
-    log.kv("optimizer", f"{t['optimizer']}, lr {t['lr']}, batch {cfg['data']['batch_size']}, tie {t['tie_self']} / "
+    sched = t.get("lr_schedule", "none")
+    log.kv("optimizer", f"{t['optimizer']}, lr {t['lr']}" + (f" (cosine to {t['min_lr']}, warmup {t['warmup']} "
+                        f"{x_name}s)" if sched == "cosine" else "") + f", batch {cfg['data']['batch_size']}, tie {t['tie_self']} / "
                         f"{t['tie_cross']}, clip grad " + (f"at {t['clip_grad_norm']}" if t["clip_grad"] else "off")
                         + ", mu penalty " + (f"{mu_coef:g} at mu > {mu_max:g}" if mu_coef > 0 else "off"))
     log.kv("splits", ", ".join(f"{s} {len(d):,}" for s, d in datasets.items()))
@@ -319,7 +348,8 @@ def main():
 
     def log_train(x):
         values, sec = window.mean()
-        values["theory/mu"] = self_attn_mu(model)                                 # at the end of the window
+        values["theory/mu"] = self_attn_mu(model)
+        values["train/lr"] = optimizer.param_groups[0]["lr"]                     # lr of the last step                                 # at the end of the window
         run.log({x_name: x, **values})
         log.info(f"{x_name} {x} | train  {fmt(values)} | {sec:.3f} s/step")
 
@@ -364,10 +394,13 @@ def main():
         set_rng_state(ckpt["rng"])                                   # same data order as without the interruption
     batch_size = cfg["data"]["batch_size"]
     if t["schedule"] == "epoch":
-        loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=cfg["data"].get("num_workers", 0))
+        per_epoch = len(loader)
         for epoch in range(start, t["epochs"] + 1):
             bar = progress(loader, f"epoch {epoch}/{t['epochs']} train")
-            for batch in bar:
+            for i, batch in enumerate(bar):
+                set_lr(optimizer, lr_at(t, (epoch - 1) * per_epoch + i, t["epochs"] * per_epoch,
+                                        t.get("warmup", 0) * per_epoch))
                 step(batch)
                 bar.set_postfix(loss=f"{window.values['train/loss'][-1]:.4f}", refresh=False)
             log_train(epoch)
@@ -378,6 +411,7 @@ def main():
         batches = iter(DataLoader(train_set, batch_size=batch_size))   # data drawn on the fly, len 1e7
         bar = progress(range(start, t["iterations"] + 1), "train", total=t["iterations"] - start + 1)
         for it in bar:
+            set_lr(optimizer, lr_at(t, it - 1, t["iterations"], t.get("warmup", 0)))
             step(next(batches))
             bar.set_postfix(loss=f"{window.values['train/loss'][-1]:.4f}", refresh=False)
             if it % LOG_EVERY == 0:
